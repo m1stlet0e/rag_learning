@@ -1,136 +1,131 @@
 from operator import itemgetter
-import torch
-from langchain.prompts.chat import (
-    ChatPromptTemplate,
-    SystemMessagePromptTemplate,
-    HumanMessagePromptTemplate,
-)
-from langchain.schema import HumanMessage
-from langchain_core.prompts import MessagesPlaceholder
-from langchain_huggingface import HuggingFaceEmbeddings
-from langchain_huggingface import HuggingFacePipeline
+from langchain.prompts import ChatPromptTemplate
+from langchain.schema import HumanMessage, SystemMessage
 from langchain_community.vectorstores import FAISS
+from langchain_core.messages import AIMessage
+from langchain_core.output_parsers import StrOutputParser
+from langchain_core.prompts import MessagesPlaceholder, HumanMessagePromptTemplate
 from transformers import AutoModelForCausalLM, AutoTokenizer, pipeline
+from langchain_huggingface import HuggingFacePipeline, HuggingFaceEmbeddings
+import torch
 
-# ========== 配置区 ==========
-EMBEDDING_MODEL = "BAAI/bge-base-zh-v1.5"  # 更优的中文Embedding模型
-LLM_MODEL = "Qwen/Qwen-1_8B-Chat"  # 确保模型路径正确
-FAISS_INDEX_PATH = "LLM.faiss"  # 向量数据库路径
-DEVICE = "mps" if torch.backends.mps.is_available() else "cpu"  # 自动检测设备
-
-# ========== 初始化Embedding模型 ==========
-embeddings = HuggingFaceEmbeddings(
-    model_name=EMBEDDING_MODEL,
-    model_kwargs={"device": DEVICE},
-    encode_kwargs={"normalize_embeddings": True}
-)
-
-# ========== 加载向量数据库 ==========
-try:
-    vector_db = FAISS.load_local(
-        FAISS_INDEX_PATH,
-        embeddings,
+# 改进的向量检索
+def load_retriever():
+    return FAISS.load_local(
+        'LLM.faiss',
+        HuggingFaceEmbeddings(
+            model_name="BAAI/bge-small-zh-v1.5",
+            model_kwargs={'device': 'mps'},
+            encode_kwargs={'normalize_embeddings': True}
+        ),
         allow_dangerous_deserialization=True
-    )
-    retriever = vector_db.as_retriever(
+    ).as_retriever(
         search_type="mmr",
-        search_kwargs={"k": 3, "score_threshold": 0.65}
+        search_kwargs={"k": 3, "lambda_mult": 0.6}
     )
-except Exception as e:
-    print(f"加载向量数据库失败: {str(e)}")
-    exit()
 
-# ========== 初始化大语言模型 ==========
-try:
+
+# 优化模型加载
+def load_model():
+    model_id = "Qwen/Qwen-1_8B-Chat"
     tokenizer = AutoTokenizer.from_pretrained(
-        LLM_MODEL,
+        model_id,
         trust_remote_code=True,
-        pad_token='<|endoftext|>'  # 重要：设置填充token
+        pad_token='<|endoftext|>'
     )
 
     model = AutoModelForCausalLM.from_pretrained(
-        LLM_MODEL,
-        device_map=DEVICE,
+        model_id,
+        device_map="auto",
+        trust_remote_code=True,
         torch_dtype=torch.float16,
-        trust_remote_code=True
+        low_cpu_mem_usage=True  # 新增内存优化
     )
 
-    pipe = pipeline(
+    return pipeline(
         "text-generation",
         model=model,
         tokenizer=tokenizer,
-        max_new_tokens=256,
-        temperature=0.6,
+        max_new_tokens=300,
+        temperature=0.5,
         top_p=0.9,
         repetition_penalty=1.1,
-        pad_token_id=tokenizer.pad_token_id  # 使用定义的pad token
+        pad_token_id=tokenizer.eos_token_id,
+        eos_token_id=tokenizer.eos_token_id
     )
 
-    chat = HuggingFacePipeline(pipeline=pipe)
-except Exception as e:
-    print(f"模型加载失败: {str(e)}")
-    exit()
+# 改进的Prompt模板
+def create_prompt():
+    return ChatPromptTemplate.from_messages([
+        SystemMessage(content="你是一个专业助理，请严格根据上下文回答问题。如果上下文不相关，直接回答不知道。"),
+        MessagesPlaceholder(variable_name="chat_history", optional=True),
+        HumanMessagePromptTemplate.from_template(
+            "相关上下文：\n{context}\n\n"
+            "请根据以上上下文回答：\n{query}"
+        )
+    ])
 
-# ========== 提示词模板 ==========
-system_template = """你是一个专业的人工智能助手，请严格遵守以下规则：
-1. 仅使用提供的上下文回答问题 
-2. 如果上下文不相关，回答"我不知道"
-3. 使用简洁的中文回答"""
-system_prompt = SystemMessagePromptTemplate.from_template(system_template)
 
-user_template = """上下文：
-{context}
+# 智能检索判断逻辑
+def should_retrieve(query):
+    # 过滤通用问候/不需要上下文的查询
+    generic_phrases = ["你好", "hi", "hello", "您好"]
+    return not any(p in query.lower() for p in generic_phrases)
 
-问题：{query}
 
-请基于上下文回答："""
-user_prompt = HumanMessagePromptTemplate.from_template(user_template)
+# 主流程
+def main():
+    retriever = load_retriever()
+    llm_pipeline = HuggingFacePipeline(pipeline=load_model())
+    prompt_template = create_prompt()
 
-full_chat_prompt = ChatPromptTemplate.from_messages([
-    system_prompt,
-    MessagesPlaceholder(variable_name="chat_history"),
-    user_prompt
-])
+    chat_chain = (
+        {
+            "context": lambda x: "\n".join([d.page_content for d in retriever.invoke(x["query"])])
+                          if should_retrieve(x["query"]) else "无相关上下文",
+            "query": itemgetter("query"),
+            "chat_history": itemgetter("chat_history")
+        }
+        | prompt_template
+        | llm_pipeline
+        | StrOutputParser()
+    )
 
-# ========== 对话链 ==========
-chat_chain = {
-                 "context": itemgetter("query") | retriever | (
-                     lambda docs: "\n\n".join([d.page_content for d in docs])),
-                 "query": itemgetter("query"),
-                 "chat_history": itemgetter("chat_history")
-             } | full_chat_prompt | chat
+    chat_history = []
+    while True:
+        try:
+            query = input("\n用户：").strip()
+            if not query:
+                continue
+            if query.lower() in ["exit", "quit"]:
+                break
 
-# ========== 对话循环 ==========
-chat_history = []
-while True:
-    try:
-        query = input('\n用户提问: ').strip()
-        if not query:
-            continue
+            response = chat_chain.invoke({
+                "query": query,
+                "chat_history": chat_history
+            })
 
-            # 执行对话链
-        response = chat_chain.invoke({
-            "query": query,
-            "chat_history": chat_history
-        })
+            # 优化后的清洗函数
+            def clean_text(text):
+                markers = ["<|endoftext|>", "助手：", "Assistant：", "System:"]
+                for m in markers:
+                    text = text.replace(m, "")
+                last_punct = max(text.rfind('。'), text.rfind('！'), text.rfind('？'))
+                return text[:last_punct+1] if last_punct != -1 else text.strip()
 
-        # 提取回答内容
-        answer = response.content.split("回答：")[-1].strip()  # 提取最终回答
+            clean_response = clean_text(response)
+            print(f"\n助手：{clean_response}")
 
-        # 显示处理结果
-        print(f"\n助手回答: {answer}")
+            # 维护历史记录（保留消息对象）
+            chat_history.extend([
+                HumanMessage(content=query),
+                AIMessage(content=clean_response)
+            ])
+            chat_history = chat_history[-4:]  # 保留最近2轮对话
 
-        # 维护对话历史
-        chat_history.extend([
-            HumanMessage(content=query),
-            response
-        ])
-        chat_history = chat_history[-4:]  # 保留最近2轮对话
+        except Exception as e:
+            print(f"出错：{str(e)}")
+            chat_history = []
 
-    except KeyboardInterrupt:
-        print("\n对话结束")
-        break
-
-    except Exception as e:
-        print(f"\n发生错误: {str(e)}")
-        chat_history = []  # 重置对话历史
+if __name__ == "__main__":
+    main()
